@@ -14,6 +14,9 @@ import signal, atexit, traceback
 import logging, logging.handlers
 import threading
 
+import paho.mqtt.client as mqtt
+import json
+
 class Config:
     def __init__(self):
         self.TXGPIO = 16
@@ -330,6 +333,9 @@ class Shutter:
 
 class OperateShutter:
 
+    def __init__(self, shutter: Shutter) -> None:
+        self.__shutter = shutter
+
     def startPIGPIO(self):
         if sys.version_info[0] < 3:
             import commands
@@ -360,7 +366,7 @@ class OperateShutter:
                     print("pigpio connection could not be established. Check logs to get more details.")
                     return False
                 else:
-                    self.LogInfo("pigpio's pi instantiated.")
+                    print("pigpio's pi instantiated.")
             except Exception as e:
                 start_pigpiod_exception = str(e)
                 print("problem instantiating pi: {}".format(start_pigpiod_exception))
@@ -368,6 +374,27 @@ class OperateShutter:
             print("start pigpiod was unsuccessful.")
             return False
         return True
+
+    def process(self, message: dict) -> None:
+        print(f"OperateShutter - incoming message {message}")
+
+        if message.get("command") == "program":
+            self.__shutter.program(message.get("name"))
+
+        if message.get("command") == "lower":
+            self.__shutter.lower(message.get("name"))
+
+        if message.get("command") == "rise":
+            self.__shutter.rise(message.get("name"))
+
+        if message.get("command") == "stop":
+            self.__shutter.stop(message.get("name"))
+        
+        if message.get("command") == "lowerPartial":
+            self.__shutter.lowerPartial(message.get("name"), message.get("percentage"))
+
+        if message.get("command") == "risePartial":
+            self.__shutter.risePartial(message.get("name"),  message.get("percentage"))
 
 class ConsoleOutput:
 
@@ -377,26 +404,84 @@ class ConsoleOutput:
     def print(self, text: str) -> None:
         print(text)
 
+class MqttReceiver:
+    def __init__(self, broker_address: str, broker_port: int, topics: list[str], operate_shutter: OperateShutter):
+        self.broker_address = broker_address
+        self.broker_port = broker_port
+        self.topics = topics
+        self.operate_shutter = operate_shutter
+
+        self.client = mqtt.Client()
+        self.client.on_message = self.on_message
+
+    def start(self):
+        self.client.connect(self.broker_address, self.broker_port)
+        for topic in self.topics:
+            self.client.subscribe(topic)
+        self.client.loop_start()
+
+    def on_message(self, client, userdata, message):
+        payload = message.payload.decode("utf-8")
+        print("Received message:", payload)
+
+        # Parse the JSON payload
+        data = json.loads(payload)
+        msg_type = data.get("msg_type")
+
+        if msg_type == "shutter_operation":
+            self.operate_shutter.process(data)
+
+    def stop(self):
+        self.client.loop_stop()
+        self.client.disconnect()
+
+
+'''
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "program"}'
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "program"}'
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "lower"}'
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "rise"}'
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "stop"}'
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "rise"}'
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "lower"}'
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "rise"}'
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "lowerPartial", "percentage": 50}'
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "risePartial", "percentage": 50}'
+pi@laurensiot:~ $ mosquitto_pub -h localhost -t shutter_control -m '{"msg_type": "shutter_operation", "name": "1", "command": "rise"}'
+'''
+
 if __name__ == "__main__":
     version = "0.0.1"
+    topics = ["shutter_control"]
+    broker_address = "127.0.0.1"
+    broker_port = 1883
 
     console = ConsoleOutput()
-    operate_shutter = OperateShutter()
+
     config = Config()
     shutter = Shutter(config)
+    operate_shutter = OperateShutter(shutter)
+    if not operate_shutter.startPIGPIO():
+        console.print("Not able to start PIGPIO") 
+        sys.exit(1)
+
+    mqtt_listener = MqttReceiver(broker_address, broker_port, topics, operate_shutter)
+    mqtt_listener.start()
 
     console.print_sep_line()
     console.print("Shutter control by Laurens:")
     console.print(f"Shutter control version: {version}")
 
-    if not operate_shutter.startPIGPIO():
-        console.print("Not able to start PIGPIO") 
-        sys.exit(1)
+    try:
+        while True:
+            pass
+            #user_input = input("Enter 'q' to stop the MQTT receiver: ")
 
-    #console.print("program remote: ")
-    shutter.program("1")
-    #console.print("shutter programmed")
-    shutter.rise("1")
-    #time.sleep(30)
-    #shutter.lower("1")
+            #if user_input.lower() == "q":
+            #    mqtt_listener.stop()
+            #    break
+
+    except KeyboardInterrupt:
+        print("\nKeyboard interrupt detected. Stopping MQTT receiver...")
+        mqtt_listener.stop()
     
